@@ -1,0 +1,913 @@
+// ==UserScript==
+// @name         SDinChat
+// @description  チャットサイト(Perplexity, ChatGPTなど)で特定のキーワード(📷file.webp, 🪄prompt...)を検出して画像を埋め込み表示/生成します。
+// @author       User
+// @match        https://chat.openai.com/*
+// @match        https://chatgpt.com/*
+// @match        https://www.perplexity.ai/*
+// @match        https://www.genspark.ai/*
+// @match        https://grok.com/*
+// @match        https://aistudio.google.com/*
+// @version      v134
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    /* =========================================================================
+     * ■ 基本設定
+     * ========================================================================= */
+
+    /**
+     * 画像サーバーのベースURL
+     * ローカル環境で動作させる場合は、自身のサーバーアドレスに変更してください。
+     * 例: "https://localhost:8443/" や "https://192.168.x.x:8443/"
+     */
+    const BASE_URL = "https://192.168.1.4545:8443/";
+
+    /**
+     * 🪄 (画像生成) で生成された画像を保存するディレクトリパス
+     * サーバー上の相対パスを指定します。末尾のスラッシュは必須です。
+     */
+    const GENERATE_DIR = "generate/";
+
+    /* =========================================================================
+     * ■ 表示スタイル設定
+     * -------------------------------------------------------------------------
+     * 画像の表示サイズをPC/モバイル、および画像タイプ別に定義します。
+     *
+     * [📷モード (既存画像表示)]
+     *   - ファイル名が "cg_" で始まる → CG画像として扱う
+     *   - さらに "_wide" を含む → ワイド表示
+     *   - それ以外 → アイコンサイズで表示
+     *
+     * [🪄モード (画像生成)]
+     *   - 生成された画像のアスペクト比で自動判定
+     *   - 横幅/高さ >= 1.2 → ワイド表示
+     *   - それ以外 → 通常表示
+     * ========================================================================= */
+    const IMAGE_STYLES = {
+        pc: {
+            // アイコン画像 (キャラの顔アイコンなど小さめの画像)
+            icon: "max-width:200px; margin:4px 0;",
+            cg: {
+                // CG画像 (通常サイズ)
+                normal: "max-width:500px; margin:8px 0;",
+                // CG画像 (ワイドサイズ)
+                wide: "max-width:700px; margin:8px 0;"
+            }
+        },
+        mobile: {
+            icon: "max-width:150px; margin:4px 0;",
+            cg: {
+                normal: "max-width:70%; margin:8px 0;",
+                wide: "max-width:100%; margin:8px 0;"
+            }
+        }
+    };
+
+    /* =========================================================================
+     * ■ スキャン動作設定
+     * ========================================================================= */
+
+    /**
+     * コンテナフィルタリングモード
+     * - "strict": 各サイトで定義されたAI応答コンテナ内のみをスキャン対象とする (推奨)
+     * - "off": ページ全体をスキャン対象とする (誤検知の可能性あり)
+     */
+    const CONTAINER_FILTER_MODE = "strict";
+
+    /**
+     * プロンプト非表示モード
+     * - true: 🪄ブロック全体を画像に置換し、プロンプトはアコーディオン内に隠す
+     * - false: 🪄絵文字のみを画像に置換し、プロンプトテキストはそのまま表示
+     */
+    const PROMPT_HIDE_MODE = true;
+
+    /* =========================================================================
+     * ■ サイト別セレクター設定
+     * -------------------------------------------------------------------------
+     * 各チャットサイトにおいて、AI応答を含むDOM要素を特定するためのCSSセレクター。
+     * CONTAINER_FILTER_MODE が "strict" の場合、ここで指定されたコンテナ内のみがスキャン対象となります。
+     *
+     * 新しいサイトを追加する場合:
+     * 1. @match にサイトのURLパターンを追加
+     * 2. ここにホスト名とセレクターの配列を追加
+     * ========================================================================= */
+    const SITE_SELECTORS = {
+        'chat.openai.com': ['[data-message-author-role="assistant"]'],
+        'chatgpt.com': ['[data-message-author-role="assistant"]'],
+        'www.perplexity.ai': ['.prose', '[data-cplx-component="message-block-answer"]'],
+        'www.genspark.ai': ['.conversation-statement.assistant'],
+        'grok.com': ['.message-bubble.w-full .response-content-markdown'],
+        'aistudio.google.com': ['.model-prompt-container[data-turn-role="Model"]']
+    };
+
+    /**
+     * 現在アクセス中のサイトに対応するセレクターを取得します。
+     * @returns {string[]} CSSセレクターの配列。未登録サイトの場合は空配列。
+     */
+    function getAllowedSelectors() {
+        const hostname = window.location.hostname;
+        return SITE_SELECTORS[hostname] || [];
+    }
+
+    /**
+     * マルチノードスキャンが必要なサイトのホスト名リスト
+     *
+     * 一部のサイト (例: Perplexity) では、ストリーミング中にテキストが複数のDOMノードに
+     * 分割されて描画されます。このようなサイトでは、単一ノードスキャンでは
+     * 🪄《...》のようなパターンを正しく検出できないため、複数ノードを結合してスキャンする必要があります。
+     */
+    const NEEDS_MULTI_NODE_SCAN = [
+        "www.perplexity.ai"
+    ];
+
+    /**
+     * 現在のサイトがマルチノードスキャンを必要とするかどうかを判定します。
+     * @returns {boolean}
+     */
+    function needsMultiNodeScan() {
+        return NEEDS_MULTI_NODE_SCAN.includes(window.location.hostname);
+    }
+
+    /* =========================================================================
+     * ■ 設計上の注意点 (Architecture Notes)
+     * -------------------------------------------------------------------------
+     * 1. 手動スキャン方式の採用理由
+     *    自動スキャンはブラウザの利用規約上グレーゾーンとなるため、
+     *    ユーザーがボタンをクリックしたときのみスキャンを実行する方式に変更。
+     *
+     * 2. マルチノードスキャン (Multi-node Scan) の必要性
+     *    Perplexityなど一部のサイトでは、ストリーミング中にテキストが細かいDOMノードに
+     *    不規則に分割されて描画されます。複数のテキストノードを
+     *    仮想的に結合してパターンマッチングを行う処理が必要です。
+     *
+     * 3. ビューポートフィルタリング (Viewport Filtering)
+     *    長時間のチャットセッションではDOM要素数が詰大になります。
+     *    ページ全体をスキャンすると動作が極端に重くなるため、getVisibleTextNodes()により
+     *    現在画面に表示されている範囲 (スクロール位置周辺±2000px) のみを処理対象として
+     *    パフォーマンスを維持しています。
+     * ========================================================================= */
+
+    /* =========================================================================
+     * ■ ユーティリティ関数
+     * ========================================================================= */
+
+    /**
+     * 指定されたノードがユーザー入力要素 (テキストボックス等) の中にあるかを判定します。
+     * 入力中のテキストを誤って置換しないためのガードとして使用します。
+     *
+     * @param {Node} node - 判定対象のノード
+     * @returns {boolean} 入力要素内にある場合はtrue
+     */
+    const isInputElement = (node) => {
+        if (!node || !node.parentNode) return false;
+        let current = node.parentNode;
+        while (current && current !== document.body) {
+            const tag = current.tagName;
+            // 標準の入力要素
+            if (["INPUT", "TEXTAREA", "SELECT"].includes(tag)) return true;
+            // contenteditable要素やリッチテキストエディタ
+            if (current.contentEditable === 'true' ||
+                current.getAttribute?.("contenteditable") === "true" ||
+                current.classList.contains("ProseMirror") ||
+                current.id === "prompt-textarea" ||
+                current.getAttribute("data-testid") === "textbox") return true;
+            current = current.parentNode;
+        }
+        return false;
+    };
+
+    /**
+     * 指定されたノードがコードブロック内にあるかを判定します。
+     * コード内のテキストを誤って置換しないためのガードとして使用します。
+     *
+     * @param {Node} node - 判定対象のノード
+     * @returns {boolean} コードブロック内にある場合はtrue
+     */
+    const isInsideCodeBlock = (node) => {
+        let current = node.parentNode;
+        while (current && current !== document.body) {
+            const tag = current.tagName;
+            const cls = current.getAttribute?.("class") || "";
+            if (tag === "CODE" || tag === "PRE" ||
+                (cls.includes("markdown") && (cls.includes("code") || cls.includes("highlight")))) {
+                return true;
+            }
+            current = current.parentNode;
+        }
+        return false;
+    };
+
+    /**
+     * 指定されたノードが許可されたコンテナ (AI応答ブロック) 内にあるかを判定します。
+     * CONTAINER_FILTER_MODE が "strict" の場合に使用され、
+     * AI応答以外の場所 (ユーザー入力欄など) での誤検知を防ぎます。
+     *
+     * @param {Node} node - 判定対象のノード
+     * @returns {boolean} 許可されたコンテナ内にある場合はtrue
+     */
+    const isInsideAllowedContainer = (node) => {
+        if (CONTAINER_FILTER_MODE === "off") return true;
+        let current = node.parentNode;
+        while (current && current !== document.body) {
+            if (getAllowedSelectors().some(sel => current.matches?.(sel))) return true;
+            current = current.parentNode;
+        }
+        return false;
+    };
+
+    /**
+     * 現在のビューポート周辺にある、処理対象のテキストノードを収集します。
+     *
+     * パフォーマンス最適化のため、以下の条件でフィルタリングを行います:
+     * - スクロール位置から±2000px以内の要素のみ対象
+     * - 入力要素、コードブロック、許可されていないコンテナ内のノードは除外
+     *
+     * @param {HTMLElement} root - 検索のルート要素 (通常はdocument.body)
+     * @returns {Text[]} テキストノードの配列
+     */
+    function getVisibleTextNodes(root) {
+        // strictモードの場合はAI応答コンテナのみを対象とする
+        const blocks = CONTAINER_FILTER_MODE === "strict"
+            ? document.querySelectorAll(getAllowedSelectors().join(','))
+            : [root];
+
+        const nodes = [];
+        const margin = 2000; // ビューポート外でも処理する余白 (px)
+        const viewportTop = window.scrollY;
+        const viewportBottom = viewportTop + window.innerHeight;
+
+        blocks.forEach(block => {
+            if (!block.getBoundingClientRect) return;
+
+            // ビューポート判定: 要素が表示範囲内 (±margin) にあるかチェック
+            const rect = block.getBoundingClientRect();
+            const absTop = rect.top + window.scrollY;
+            const absBottom = rect.bottom + window.scrollY;
+            if (absBottom >= viewportTop - margin && absTop <= viewportBottom + margin) {
+                // TreeWalkerでテキストノードを収集
+                const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+                    acceptNode: (node) =>
+                        isInputElement(node) || isInsideCodeBlock(node) || !isInsideAllowedContainer(node)
+                            ? NodeFilter.FILTER_REJECT
+                            : NodeFilter.FILTER_ACCEPT
+                });
+                let n;
+                while ((n = walker.nextNode())) nodes.push(n);
+            }
+        });
+        return nodes;
+    }
+
+
+    /* =========================================================================
+     * ■ パターンマッチング用正規表現
+     * ========================================================================= */
+
+    /**
+     * 📷モード: 既存画像表示用の正規表現
+     * パターン: 📷《filename.webp》
+     *
+     * ファイル名に使用可能な文字: 英数字、ハイフン、アンダースコア、スラッシュ (パス区切り)
+     */
+    const cameraRegex = /📷《([\w\-/]+\.webp)》/giu;
+
+    /**
+     * 🪄モード: 画像生成用の正規表現
+     * パターン: 🪄《...内容...》
+     *
+     * 内容は parseWandContent() で詳細にパースされます。
+     * 改行を含む任意の文字にマッチしますが、閉じ括弧の記載漏れによる
+     * 暴走を防ぐため、最大5000文字に制限しています。
+     */
+    const wandBlockRegex = /🪄《([\s\S]{1,5000}?)》/gu;
+
+    /* =========================================================================
+     * ■ スタイル決定関数
+     * ========================================================================= */
+
+    /**
+     * ファイル名に基づいて適用すべきCSSスタイル文字列を決定します。
+     *
+     * @param {string} filename - 画像ファイル名 (パスを含む場合あり)
+     * @returns {string} CSSスタイル文字列
+     */
+    const getStyleString = (filename) => {
+        const baseName = filename.split("/").pop();
+        const isCG = baseName.startsWith("cg_");
+        const isWide = baseName.includes("_wide");
+        const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+        const config = isMobile ? IMAGE_STYLES.mobile : IMAGE_STYLES.pc;
+
+        if (isCG) {
+            return isWide ? config.cg.wide : config.cg.normal;
+        } else {
+            return config.icon;
+        }
+    };
+
+    /* =========================================================================
+     * ■ 🪄ブロックのパース関数
+     * ========================================================================= */
+
+    /**
+     * 🪄《...》ブロックの中身を解析し、各パラメータを抽出します。
+     *
+     * 対応フォーマット:
+     * - prompt: <プロンプトテキスト>      ※必須
+     * - filename: <ファイル名.webp>        ※必須
+     * - preset: <プリセット名>             ※任意
+     * - res: <幅>x<高さ> または res: <幅>_<高さ>  ※任意
+     *
+     * 全角コロン(：)は半角に正規化され、改行はスペースに変換されます。
+     *
+     * @param {string} rawContent - 🪄《》内のテキスト
+     * @returns {{prompt: string|null, filename: string|null, preset: string|null, resolution: string|null}}
+     */
+    const parseWandContent = (rawContent) => {
+        // 全角コロンを半角に正規化、改行をスペースに変換
+        let text = rawContent.replace(/：/g, ":").replace(/[\r\n]+/g, " ");
+
+        // filename の抽出 (拡張子.webp必須、パス区切り可)
+        let filename = null;
+        const fileMatch = text.match(/(?:filename|file)\s*:\s*([\w\-/.]+\.webp)/i);
+        if (fileMatch) {
+            filename = fileMatch[1];
+            text = text.replace(fileMatch[0], ""); // 抽出済み部分を削除
+        }
+
+        // preset の抽出 (任意パラメータ)
+        let preset = null;
+        const presetMatch = text.match(/preset\s*:\s*([\w\-.]+)/i);
+        if (presetMatch) {
+            preset = presetMatch[1];
+            text = text.replace(presetMatch[0], "");
+        }
+
+        // resolution の抽出 (任意パラメータ)
+        // フォーマット: res: 1024x768 または res: 1024_768
+        // ※ キーなしの数値だけの記述はプロンプトと区別できないため認めない
+        let resolution = null;
+        const resMatch = text.match(/(?:res|resolution)\s*:\s*(\d+)[_x](\d+)/i);
+        if (resMatch) {
+            // サーバーには "幅x高さ" の形式で渡す
+            resolution = `${resMatch[1]}x${resMatch[2]}`;
+            text = text.replace(resMatch[0], "");
+        }
+
+        // prompt の抽出 (必須パラメータ)
+        // フォーマット: prompt: <テキスト> (パイプ文字 | で終端するか、文末まで)
+        let prompt = null;
+        const promptMatch = text.match(/prompt\s*:\s*([^|]+)/i);
+        if (promptMatch) {
+            prompt = promptMatch[1].trim();
+        }
+
+        return { prompt, filename, preset, resolution };
+    };
+
+    /* =========================================================================
+     * ■ 画像要素生成関数
+     * ========================================================================= */
+
+    /**
+     * 📷モード用: 既存画像の <img> 要素を生成します。
+     *
+     * @param {string} filename - 画像ファイル名
+     * @returns {HTMLSpanElement} 画像を内包するspan要素
+     */
+    const makeCameraImage = (filename) => {
+        const url = BASE_URL + filename;
+        const img = document.createElement("img");
+        img.src = url;
+        img.alt = `⚠️ ${filename}`; // 読み込み失敗時に表示される代替テキスト
+        img.style.verticalAlign = "middle";
+        img.style.cssText += getStyleString(filename);
+
+        const wrapper = document.createElement("span");
+        wrapper.style.display = "inline-block";
+        wrapper.style.marginRight = "8px";
+        wrapper.appendChild(img);
+        return wrapper;
+    };
+
+    /**
+     * 🪄モード用 (プロンプト非表示モード): アコーディオン形式の画像要素を生成します。
+     *
+     * 画像をクリックすると、生成に使用したプロンプトや各種パラメータを確認できます。
+     * また、ゴミ箱ボタンで生成画像を削除することも可能です。
+     *
+     * @param {string} prompt - 画像生成プロンプト
+     * @param {string} filename - 保存ファイル名
+     * @param {string|null} preset - プリセット名 (任意)
+     * @param {string|null} resolution - 解像度 (任意)
+     * @returns {HTMLDetailsElement} アコーディオン形式のdetails要素
+     */
+    const makeWandDetails = (prompt, filename, preset, resolution) => {
+        // 画像生成APIのURLを構築
+        let url = `${BASE_URL}${GENERATE_DIR}${filename}?gen_image=1&prompt=${encodeURIComponent(prompt)}`;
+        if (preset) url += `&preset=${encodeURIComponent(preset)}`;
+        if (resolution) url += `&resolution=${encodeURIComponent(resolution)}`;
+
+        // --- アコーディオン本体 ---
+        const details = document.createElement("details");
+        details.style.display = "inline-block";
+        details.style.verticalAlign = "middle";
+        details.style.margin = "0 8px 0 0";
+
+        // --- サマリー (常時表示される画像部分) ---
+        const summary = document.createElement("summary");
+        summary.style.listStyle = "none";
+        summary.style.cursor = "pointer";
+        summary.style.display = "inline-block";
+        summary.style.padding = "0";
+
+        const img = document.createElement("img");
+        img.src = url;
+        img.alt = `🪄 ${filename}`;
+        img.title = "クリックして生成パラメータを表示";
+        img.style.verticalAlign = "middle";
+
+        // 生成待ち中のプレースホルダー表示 (水色の四角)
+        img.style.minWidth = "200px";
+        img.style.minHeight = "200px";
+        img.style.backgroundColor = "#e0f7fa";
+        img.style.border = "1px solid #fcfcfc";
+        img.style.margin = "8px 0";
+        img.style.maxWidth = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? "70%" : "500px";
+
+        // 画像読み込み完了時: プレースホルダーを解除し、アスペクト比に応じたスタイルを適用
+        img.onload = () => {
+            img.style.backgroundColor = "transparent";
+            img.style.border = "none";
+            const aspect = img.naturalWidth / img.naturalHeight;
+            const isWide = aspect >= 1.2;
+
+            const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+            const config = isMobile ? IMAGE_STYLES.mobile : IMAGE_STYLES.pc;
+            const style = isWide ? config.cg.wide : config.cg.normal;
+            img.style.cssText += style;
+        };
+
+        // 画像読み込み失敗時: エラー表示
+        img.onerror = () => {
+            img.style.backgroundColor = "#fee";
+            img.style.border = "1px solid red";
+            img.alt = "❌ 画像の読み込みに失敗しました";
+        };
+
+        summary.appendChild(img);
+        details.appendChild(summary);
+
+        // --- 展開時に表示されるプロンプト情報 ---
+        const promptText = document.createElement("div");
+        promptText.style.fontSize = "0.92em";
+        promptText.style.padding = "4px 8px";
+        promptText.style.whiteSpace = "pre-wrap";
+        promptText.style.border = "1px solid #bbb";
+        promptText.style.borderRadius = "8px";
+        promptText.style.marginTop = "4px";
+        promptText.style.background = "transparent";
+        promptText.textContent =
+            `prompt: ${prompt}\nfilename: ${filename}` +
+            (preset ? `\npreset: ${preset}` : "") +
+            (resolution ? `\nres: ${resolution}` : "");
+        details.appendChild(promptText);
+
+        // --- ゴミ箱ボタン ---
+        const delBtn = document.createElement("button");
+        delBtn.textContent = "🗑️";
+        delBtn.title = "この画像をゴミ箱へ移動";
+        delBtn.style.display = "inline-block";
+        delBtn.style.marginLeft = "6px";
+        delBtn.style.padding = "2px 6px";
+        delBtn.style.cursor = "pointer";
+        delBtn.style.border = "1px solid #ddd";
+        delBtn.style.borderRadius = "4px";
+        delBtn.style.backgroundColor = "#fff";
+        delBtn.style.fontSize = "0.9em";
+        delBtn.style.verticalAlign = "middle";
+        delBtn.style.transition = "background-color 0.2s";
+
+        // ホバーエフェクト
+        delBtn.onmouseover = () => {
+            delBtn.style.backgroundColor = "#ffebee";
+            delBtn.style.borderColor = "#ef9a9a";
+        };
+        delBtn.onmouseout = () => {
+            delBtn.style.backgroundColor = "#fff";
+            delBtn.style.borderColor = "#ddd";
+        };
+
+        // 削除処理
+        delBtn.onclick = (e) => {
+            e.preventDefault();
+            if (!confirm("この画像をゴミ箱へ移動しますか？\n※ ページをリロードすると再生成されます。")) return;
+
+            delBtn.textContent = "⏳ 移動中...";
+            delBtn.disabled = true;
+
+            // Image要素を使用してAPIリクエスト (CORS回避のため)
+            const trashImg = new Image();
+            const targetPath = GENERATE_DIR + filename;
+            trashImg.src = `${BASE_URL}api/trash?path=${encodeURIComponent(targetPath)}&t=${Date.now()}`;
+
+            trashImg.onload = () => {
+                // 削除成功: UIを更新
+                delBtn.textContent = "✓";
+                delBtn.style.border = "1px solid #4caf50";
+                delBtn.style.color = "#4caf50";
+
+                // 削除済みであることを視覚的に表示
+                details.style.opacity = "0.6";
+                promptText.style.textDecoration = "line-through";
+                const thumb = details.querySelector("img");
+                if (thumb) thumb.style.opacity = "0.4";
+
+                console.log("[AIChat Image Replacer] ゴミ箱へ移動:", filename);
+            };
+
+            trashImg.onerror = () => {
+                // 削除失敗: エラー表示
+                alert("❌ 削除に失敗しました\nサーバーが起動しているか確認してください。");
+                console.error("[AIChat Image Replacer] ゴミ箱移動リクエスト失敗");
+                delBtn.textContent = "🗑️";
+                delBtn.disabled = false;
+            };
+        };
+
+        promptText.appendChild(delBtn);
+
+        return details;
+    };
+
+    /**
+     * 🪄モード用 (プロンプト表示モード): シンプルな画像要素を生成します。
+     *
+     * プロンプトテキストは置換せず、🪄絵文字のみを画像に置換します。
+     * PROMPT_HIDE_MODE = false の場合に使用されます。
+     *
+     * @param {string} prompt - 画像生成プロンプト
+     * @param {string} filename - 保存ファイル名
+     * @param {string|null} preset - プリセット名 (任意)
+     * @param {string|null} resolution - 解像度 (任意)
+     * @returns {HTMLSpanElement} 画像を内包するspan要素
+     */
+    const makeWandImage = (prompt, filename, preset, resolution) => {
+        // 画像生成APIのURLを構築
+        let url = `${BASE_URL}${GENERATE_DIR}${filename}?gen_image=1&prompt=${encodeURIComponent(prompt)}`;
+        if (preset) url += `&preset=${encodeURIComponent(preset)}`;
+        if (resolution) url += `&resolution=${encodeURIComponent(resolution)}`;
+
+        const img = document.createElement("img");
+        img.src = url;
+        img.alt = `🪄 ${filename}`;
+        img.title = prompt; // ツールチップでプロンプトを表示
+        img.style.verticalAlign = "middle";
+
+        // 生成待ち中のプレースホルダー表示
+        img.style.minWidth = "200px";
+        img.style.minHeight = "200px";
+        img.style.backgroundColor = "#e0f7fa";
+        img.style.border = "1px solid #fcfcfc";
+        img.style.margin = "8px 0";
+        img.style.maxWidth = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? "70%" : "500px";
+
+        // 暫定スタイル (読み込み完了後に上書きされる)
+        img.style.cssText += getStyleString(filename);
+
+        // 画像読み込み完了時
+        img.onload = () => {
+            img.style.backgroundColor = "transparent";
+            img.style.border = "none";
+            const aspect = img.naturalWidth / img.naturalHeight;
+            const isWide = aspect >= 1.2;
+
+            const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+            const config = isMobile ? IMAGE_STYLES.mobile : IMAGE_STYLES.pc;
+            const style = isWide ? config.cg.wide : config.cg.normal;
+            img.style.cssText += style;
+        };
+
+        // 画像読み込み失敗時
+        img.onerror = () => {
+            img.style.backgroundColor = "#fee";
+            img.style.border = "1px solid red";
+            img.alt = "❌ 画像の読み込みに失敗しました";
+        };
+
+        const wrapper = document.createElement("span");
+        wrapper.style.display = "inline-block";
+        wrapper.style.marginRight = "8px";
+        wrapper.appendChild(img);
+        return wrapper;
+    };
+
+    /* =========================================================================
+     * ■ テキストノード置換処理
+     * ========================================================================= */
+
+    /**
+     * 📷モード: テキストノード内の 📷《filename.webp》 パターンを画像に置換します。
+     *
+     * @param {HTMLElement} root - 検索のルート要素
+     */
+    const replaceCameraTextNodes = (root) => {
+        getVisibleTextNodes(root).forEach(node => {
+            const content = node.textContent;
+            cameraRegex.lastIndex = 0;
+            if (!cameraRegex.test(content)) return;
+            cameraRegex.lastIndex = 0;
+
+            const span = document.createElement("span");
+            let lastIndex = 0;
+            // サロゲートペア安全な配列化 (絵文字対応)
+            let arr = Array.from(content);
+
+            for (let match; (match = cameraRegex.exec(content));) {
+                const start = match.index;
+                const end = start + match[0].length;
+                span.appendChild(document.createTextNode(arr.slice(lastIndex, start).join("")));
+                span.appendChild(makeCameraImage(match[1]));
+                lastIndex = end;
+            }
+            span.appendChild(document.createTextNode(arr.slice(lastIndex).join("")));
+            node.parentNode.replaceChild(span, node);
+        });
+    };
+
+    /**
+     * 🪄モード (単一ノードスキャン): テキストノード内の 🪄《...》 パターンを画像に置換します。
+     *
+     * ほとんどのサイトではこの単一ノードスキャンで十分ですが、
+     * Perplexityなど一部のサイトではマルチノードスキャンも併用する必要があります。
+     *
+     * @param {HTMLElement} root - 検索のルート要素
+     */
+    const replaceGenImageTriggerSingleNode = (root) => {
+        getVisibleTextNodes(root).forEach(node => {
+            const content = node.textContent;
+            wandBlockRegex.lastIndex = 0;
+            const match = wandBlockRegex.exec(content);
+            if (!match) return;
+
+            // 🪄ブロックの中身をパース
+            const { prompt, filename, preset, resolution } = parseWandContent(match[1]);
+
+            // 必須パラメータが欠けている場合は置換しない
+            if (!prompt || !filename) return;
+
+            const span = document.createElement('span');
+            if (PROMPT_HIDE_MODE) {
+                // プロンプト非表示モード: ブロック全体をアコーディオン画像に置換
+                span.appendChild(makeWandDetails(prompt, filename, preset, resolution));
+            } else {
+                // プロンプト表示モード: 🪄絵文字のみを画像に置換
+                const wandIdx = Array.from(content).indexOf('🪄');
+                if (wandIdx >= 0) {
+                    const arrWand = Array.from(content);
+                    const before = arrWand.slice(0, wandIdx).join("");
+                    const after = arrWand.slice(wandIdx + 1).join("");
+                    span.appendChild(document.createTextNode(before));
+                    span.appendChild(makeWandImage(prompt, filename, preset, resolution));
+                    span.appendChild(document.createTextNode(after));
+                } else {
+                    span.appendChild(document.createTextNode(content));
+                }
+            }
+            node.parentNode.replaceChild(span, node);
+        });
+    };
+
+    /**
+     * 🪄モード (マルチノードスキャン): 複数のテキストノードにまたがる 🪄《...》 パターンを検出・置換します。
+     *
+     * 一部のサイト (Perplexityなど) では、ストリーミング中にテキストが複数のDOMノードに
+     * 分割されて描画されます。この関数は複数ノードを仮想的に結合してパターンマッチングを行い、
+     * 該当部分を置換します。
+     *
+     * @param {HTMLElement} root - 検索のルート要素
+     */
+    function replaceGenImageTriggerMultiNode(root) {
+        // マルチノードスキャンが不要なサイトでは何もしない
+        if (!needsMultiNodeScan()) return;
+
+        const nodes = getVisibleTextNodes(root);
+        if (!nodes.length) return;
+
+        // 各ノードのテキストをサロゲートペア安全な配列に変換
+        const nodeArrs = nodes.map(n => Array.from(n.textContent));
+        const fullArr = nodeArrs.flat();
+        const fullText = fullArr.join('');
+
+        wandBlockRegex.lastIndex = 0;
+        const match = wandBlockRegex.exec(fullText);
+        if (!match) return;
+
+        // 🪄ブロックの中身をパース
+        const { prompt, filename, preset, resolution } = parseWandContent(match[1]);
+        if (!prompt || !filename) return;
+
+        // マッチ位置の計算 (文字配列上のインデックス)
+        const strUpToMatch = fullText.slice(0, match.index);
+        const arrMatchStart = Array.from(strUpToMatch).length;
+        const matchArr = Array.from(match[0]);
+        const arrMatchEnd = arrMatchStart + matchArr.length;
+        const wandIdxInMatch = matchArr.indexOf('🪄');
+
+        // 各ノードが結合後配列上のどの範囲に対応するか計算
+        let nodeStartIdx = 0;
+        const nodeRanges = nodeArrs.map(arr => {
+            const range = { start: nodeStartIdx, end: nodeStartIdx + arr.length };
+            nodeStartIdx += arr.length;
+            return range;
+        });
+
+        let replaced = false;
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            const range = nodeRanges[i];
+            const nodeArr = nodeArrs[i];
+
+            if (PROMPT_HIDE_MODE && !replaced && arrMatchStart < range.end && arrMatchEnd > range.start) {
+                // プロンプト非表示モード: 置換範囲がこのノードにかかっている場合
+                const localStart = Math.max(0, arrMatchStart - range.start);
+                const localEnd = Math.min(nodeArr.length, arrMatchEnd - range.start);
+                const before = nodeArr.slice(0, localStart).join('');
+                const after = nodeArr.slice(localEnd).join('');
+
+                const span = document.createElement("span");
+                span.appendChild(document.createTextNode(before));
+                span.appendChild(makeWandDetails(prompt, filename, preset, resolution));
+                span.appendChild(document.createTextNode(after));
+                node.parentNode?.replaceChild(span, node);
+                replaced = true;
+
+            } else if (PROMPT_HIDE_MODE && replaced && arrMatchStart < range.end && arrMatchEnd > range.start) {
+                // 既に置換済みだが、マッチ範囲内にある後続ノードの内容をクリア
+                node.textContent = '';
+
+            } else if (!PROMPT_HIDE_MODE && arrWandIdx >= range.start && arrWandIdx < range.end) {
+                // プロンプト表示モード: 🪄絵文字を含むノードを置換
+                const localWandIdx = arrWandIdx - range.start;
+                const before = nodeArr.slice(0, localWandIdx).join('');
+                const after = nodeArr.slice(localWandIdx + 1).join('');
+
+                const span = document.createElement('span');
+                span.appendChild(document.createTextNode(before));
+                span.appendChild(makeWandImage(prompt, filename, preset, resolution));
+                span.appendChild(document.createTextNode(after));
+                node.parentNode?.replaceChild(span, node);
+                break;
+            }
+        }
+    }
+
+    /* =========================================================================
+     * ■ メインスキャン処理
+     * ========================================================================= */
+
+    /**
+     * 📷と🪄の両方のパターンについて、フルスキャンを実行します。
+     */
+    function fullScan() {
+        replaceCameraTextNodes(document.body);
+        replaceGenImageTriggerSingleNode(document.body);
+        replaceGenImageTriggerMultiNode(document.body);
+    }
+
+    /* =========================================================================
+     * ■ フローティングスキャンボタン
+     * ========================================================================= */
+
+    /** ボタン位置の状態 (true: 上, false: 下) */
+    let isButtonTop = false;
+
+    /**
+     * フローティングスキャンボタンを作成してDOMに挿入します。
+     * ボタンをクリックすると、手動でフルスキャンが実行されます。
+     */
+    function createScanButton() {
+        // 既存のボタンがあれば削除
+        const existing = document.getElementById('sdinchat-scan-container');
+        if (existing) existing.remove();
+
+        // コンテナ作成
+        const container = document.createElement('div');
+        container.id = 'sdinchat-scan-container';
+        container.style.cssText = `
+            position: fixed;
+            ${isButtonTop ? 'top: 20px;' : 'bottom: 20px;'}
+            right: 20px;
+            z-index: 999999;
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 8px;
+        `;
+
+        // --- メインスキャンボタン ---
+        const scanBtn = document.createElement('button');
+        scanBtn.id = 'sdinchat-scan-button';
+        scanBtn.textContent = '🔍 スキャン';
+        scanBtn.style.cssText = `
+            padding: 12px 18px;
+            font-size: 14px;
+            font-weight: bold;
+            border: none;
+            border-radius: 50px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+            transition: transform 0.2s, box-shadow 0.2s;
+            user-select: none;
+        `;
+        scanBtn.onmouseenter = () => {
+            scanBtn.style.transform = 'scale(1.05)';
+            scanBtn.style.boxShadow = '0 6px 20px rgba(102, 126, 234, 0.6)';
+        };
+        scanBtn.onmouseleave = () => {
+            scanBtn.style.transform = 'scale(1)';
+            scanBtn.style.boxShadow = '0 4px 15px rgba(102, 126, 234, 0.4)';
+        };
+        scanBtn.onclick = () => {
+            scanBtn.textContent = '⏳ スキャン中...';
+            scanBtn.disabled = true;
+            setTimeout(() => {
+                fullScan();
+                scanBtn.textContent = '✓ 完了';
+                setTimeout(() => {
+                    scanBtn.textContent = '🔍 スキャン';
+                    scanBtn.disabled = false;
+                }, 800);
+            }, 50);
+        };
+
+        // --- 位置切り替えボタン ---
+        const toggleBtn = document.createElement('button');
+        toggleBtn.id = 'sdinchat-toggle-position';
+        toggleBtn.textContent = isButtonTop ? '⬇' : '⬆';
+        toggleBtn.title = 'ボタンの位置を切り替え';
+        toggleBtn.style.cssText = `
+            padding: 6px 10px;
+            font-size: 12px;
+            border: none;
+            border-radius: 50%;
+            background: rgba(100, 100, 100, 0.7);
+            color: white;
+            cursor: pointer;
+            transition: background 0.2s;
+            user-select: none;
+        `;
+        toggleBtn.onmouseenter = () => {
+            toggleBtn.style.background = 'rgba(100, 100, 100, 0.9)';
+        };
+        toggleBtn.onmouseleave = () => {
+            toggleBtn.style.background = 'rgba(100, 100, 100, 0.7)';
+        };
+        toggleBtn.onclick = () => {
+            isButtonTop = !isButtonTop;
+            createScanButton(); // 再描画
+        };
+
+        container.appendChild(scanBtn);
+        container.appendChild(toggleBtn);
+        document.body.appendChild(container);
+
+        console.log('[SDinChat] フローティングスキャンボタンを作成しました');
+    }
+
+    /* =========================================================================
+     * ■ 初期化処理
+     * ========================================================================= */
+
+    /**
+     * スクリプトの初期化を安全に実行します。
+     *
+     * ページ読み込み直後はDOM構造が不安定な場合があるため、
+     * 2秒の遅延を設けてから処理を開始します。
+     */
+    function safeInit() {
+        setTimeout(() => {
+            createScanButton();
+            fullScan(); // 初回は自動でスキャン
+            console.log('[SDinChat] 初期化完了');
+        }, 2000);
+    }
+
+    // --- エントリーポイント ---
+    if (document.readyState === "complete") {
+        // ページが既に完全読み込み済みの場合
+        safeInit();
+    } else {
+        // まだ読み込み中の場合はイベントを待機
+        window.addEventListener("load", safeInit);
+        // bfcache (Back/Forward Cache) からの復元時にも再初期化
+        window.addEventListener("pageshow", (e) => {
+            if (e.persisted) safeInit();
+        });
+    }
+})();
