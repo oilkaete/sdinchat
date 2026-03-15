@@ -24,7 +24,7 @@ CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 ADMIN_DIR = os.path.join(BASE_DIR, "admin")
 
 # セキュリティ: 許可するIP (ローカルLAN)
-# 必要に応じて追加・変更してください
+# 必要に応じて追加してください
 ALLOWED_IPS = ['127.0.0.1', '192.168.1.4545', '192.168.1.454545']
 
 # ディレクトリが存在するか確認し、なければ作成
@@ -75,6 +75,102 @@ def list_preset_folders():
                     files.append(f.name[:-5])  # .json を除去
             folders.append({"name": entry.name, "presets": files})
     return folders
+
+
+# =====================================================
+#  リビジョンチェーン (再生成時のファイル管理)
+# =====================================================
+def _revision_path(filepath, n):
+    """
+    N番目のリビジョンファイルパスを返します。
+    例: pic.webp → pic_r1.webp (n=1), pic_r2.webp (n=2)
+    n=0 の場合は元のパスをそのまま返します。
+    """
+    if n == 0:
+        return filepath
+    base, ext = os.path.splitext(filepath)
+    return f"{base}_r{n}{ext}"
+
+def _resolve_rewrite_chain(filepath):
+    """
+    リビジョンチェーンを辿り、最新の有効ファイルパスを返します。
+    .rewrite マーカーがあるファイルはスキップし、マーカーなしの最新版を返します。
+    有効なファイルが見つからなければ None を返します。
+    """
+    # まず元ファイルを確認
+    current = filepath
+    if not os.path.isfile(current):
+        return None
+
+    # .rewrite マーカーがなければそのまま返す
+    if not os.path.exists(current + ".rewrite"):
+        return current
+
+    # チェーンを辿る (安全のため上限100)
+    for i in range(1, 100):
+        rev = _revision_path(filepath, i)
+        if not os.path.isfile(rev):
+            return None  # チェーン途切れ = 有効ファイルなし
+        if not os.path.exists(rev + ".rewrite"):
+            return rev   # マーカーなし = これが最新版
+    return None
+
+def _next_generation_path(filepath):
+    """
+    次に生成すべきファイルパスを返します。
+    チェーンを辿り、初めてファイルが存在しないスロットを返します。
+    元ファイルが存在しない場合は元のパスをそのまま返します。
+    """
+    if not os.path.isfile(filepath):
+        return filepath
+
+    # 元ファイルに .rewrite がなければ元ファイル自体がターゲット
+    # (通常はここには来ない: ファイルが存在する場合はgen_imageに到達しない)
+    if not os.path.exists(filepath + ".rewrite"):
+        return filepath
+
+    for i in range(1, 100):
+        rev = _revision_path(filepath, i)
+        if not os.path.isfile(rev):
+            return rev
+        if not os.path.exists(rev + ".rewrite"):
+            # ファイルはあるがマーカーなし → このファイルは最新版
+            # 次の再生成ではここにマーカーが付くので、さらに次へ
+            # ただしここに来るのは mark_rewrite が先に呼ばれた後
+            return rev
+    return filepath
+
+def _mark_latest_for_rewrite(filepath):
+    """
+    チェーンの末端 (最新の書き換えフラグなしファイル) に .rewrite マーカーを付与します。
+    ファイルが存在しない場合は何もしません。
+    次に生成されるファイルのパスを返します。
+    """
+    current = filepath
+    if not os.path.isfile(current):
+        # 元ファイルがない → 何もしない、元のパスを返す
+        return filepath
+
+    if not os.path.exists(current + ".rewrite"):
+        # 元ファイルにマーカーをつける
+        open(current + ".rewrite", "w").close()
+        print(f"[🔄] リビジョンマーカー付与: {os.path.basename(current)}")
+        return _revision_path(filepath, 1)
+
+    # チェーンを辿る
+    for i in range(1, 100):
+        rev = _revision_path(filepath, i)
+        if not os.path.isfile(rev):
+            # ファイルがない → 元ファイルにはマーカーがあるので次はここ
+            return rev
+        if not os.path.exists(rev + ".rewrite"):
+            # これが最新版 → マーカーをつける
+            open(rev + ".rewrite", "w").close()
+            print(f"[🔄] リビジョンマーカー付与: {os.path.basename(rev)}")
+            return _revision_path(filepath, i + 1)
+
+    return filepath
+
 
 # SimpleHTTPRequestHandlerのために作業ディレクトリをPUBLIC_DIRに変更 (安全なデフォルト)
 os.chdir(PUBLIC_DIR)
@@ -421,6 +517,19 @@ class GenImageHandler(SimpleHTTPRequestHandler):
             self._send_json(list_preset_folders())
             return
 
+        # === 管理API: プリセット内容取得 (/api/preset?folder=xxx&name=default) ===
+        if parsed.path == "/api/preset":
+            pqs = urllib.parse.parse_qs(parsed.query)
+            folder = pqs.get("folder", [APP_CONFIG.get("backend", "sdwebui")])[0]
+            name = pqs.get("name", ["default"])[0]
+            path = _load_preset(folder, name)
+            if path:
+                with open(path, "r", encoding="utf-8") as f:
+                    self._send_json(json.load(f))
+            else:
+                self._send_json({"error": "not found"}, status=404)
+            return
+
         # === 管理画面 (/admin/) ===
         if parsed.path.startswith("/admin"):
             # /admin → /admin/ にリダイレクト
@@ -447,6 +556,62 @@ class GenImageHandler(SimpleHTTPRequestHandler):
                     self.wfile.write(f.read())
             else:
                 self.send_error(404, "Not Found")
+            return
+
+        # === 管理API: 書き換えフラグ付与 (/api/mark_rewrite?path=generate/pic.webp) ===
+        if parsed.path == "/api/mark_rewrite":
+            target_rel = urllib.parse.parse_qs(parsed.query).get("path", [""])[0]
+            if not target_rel:
+                self._send_json({"error": "pathパラメータが必要です"}, status=400)
+                return
+            target_abs = os.path.join(PUBLIC_DIR, target_rel)
+            if not is_safe_path(PUBLIC_DIR, target_abs):
+                self._send_json({"error": "不正なパス"}, status=403)
+                return
+
+            next_path = _mark_latest_for_rewrite(target_abs)
+            next_rel = os.path.relpath(next_path, PUBLIC_DIR).replace("\\", "/")
+            print(f"[🔄] mark_rewrite: {target_rel} → 次の生成先: {next_rel}")
+
+            # Imageビーコン対応: 透明PNGを返す (CORS回避のため)
+            png_data = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(png_data)
+            return
+
+        # === 管理API: プロンプトクリップボード (/api/clipboard?data=...) ===
+        if parsed.path == "/api/clipboard":
+            data_str = urllib.parse.parse_qs(parsed.query).get("data", [""])[0]
+            clipboard_path = os.path.join(BASE_DIR, "clipboard.json")
+
+            if not data_str:
+                # GETモード: 保存済みクリップボードを返す
+                if os.path.isfile(clipboard_path):
+                    with open(clipboard_path, "r", encoding="utf-8") as f:
+                        self._send_json(json.load(f))
+                else:
+                    self._send_json(None)
+                return
+
+            # 書き込みモード
+            try:
+                data = json.loads(data_str)
+                with open(clipboard_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                print(f"[📋] クリップボード保存: {data.get('filename', '?')}")
+            except Exception as e:
+                print(f"[🔥] クリップボード保存エラー: {e}")
+
+            # 画像ビーコン対応: 透明PNGを返す
+            png_data = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(png_data)
             return
 
         # === 画像ゴミ箱移動 API (/api/trash?path=generate/xyz.webp) ===
@@ -498,18 +663,37 @@ class GenImageHandler(SimpleHTTPRequestHandler):
             self.send_error(403, "Forbidden Path")
             return
             
-        # ファイルが存在すれば SimpleHTTPRequestHandler に任せる
-        if os.path.exists(filepath) and os.path.isfile(filepath):
-            # self.path を作業ディレクトリ(PUBLIC_DIR)からの相対パスに書き換える
-            # SimpleHTTPRequestHandler は self.path を現在のディレクトリ(os.getcwd())からの相対パスとして扱う
-            self.path = "/" + safe_req_path
-            return super().do_GET()
-
-        # gen_imageフラグがない、かつファイルもないなら404
+        # gen_imageフラグの確認 (ファイル存在チェック前に解析)
         qs = urllib.parse.parse_qs(parsed.query)
-        if "gen_image" not in qs:
-            self.send_error(404, "File Not Found")
-            return
+        is_gen_request = "gen_image" in qs
+
+        # === リビジョンチェーン解決 ===
+        # ファイルが存在する場合、.rewrite マーカーを达って最新版を特定
+        if os.path.exists(filepath) and os.path.isfile(filepath):
+            resolved = _resolve_rewrite_chain(filepath)
+
+            if resolved:
+                # 最新版が見つかった
+                if is_gen_request and "no_overwrite" in qs:
+                    self._send_json({"error": "ファイルが既に存在します", "filename": safe_req_path}, status=409)
+                    return
+                # 解決されたファイルを配信
+                resolved_rel = os.path.relpath(resolved, PUBLIC_DIR).replace("\\", "/")
+                self.path = "/" + resolved_rel
+                return super().do_GET()
+            else:
+                # チェーン末端にファイルがない → gen_imageがあれば生成へ
+                if not is_gen_request:
+                    self.send_error(404, "File Not Found")
+                    return
+                # 生成パスをチェーン次スロットに設定
+                filepath = _next_generation_path(filepath)
+                print(f"[🔄] リビジョン生成: {os.path.basename(filepath)}")
+        else:
+            # ファイルが存在しない
+            if not is_gen_request:
+                self.send_error(404, "File Not Found")
+                return
 
         # -------------------------------------------------
         # ここから画像生成ロジック
@@ -555,6 +739,27 @@ class GenImageHandler(SimpleHTTPRequestHandler):
             # --- バックエンド自動判別 ---
             backend = _detect_backend(payload)
             print(f"     Backend: {backend}")
+
+            # --- プリセットプロンプトの上書き (base_prompt / base_negative) ---
+            base_prompt_override = qs.get("base_prompt", [None])[0]
+            base_negative_override = qs.get("base_negative", [None])[0]
+            if base_prompt_override is not None or base_negative_override is not None:
+                if backend == "comfyui":
+                    # ComfyUI: CLIPTextEncodeノードのtextを上書き
+                    clip_nodes = _find_nodes_by_class(payload, "CLIPTextEncode")
+                    for node_id, node in clip_nodes:
+                        title = node.get("_meta", {}).get("title", "").lower()
+                        if "positive" in title and base_prompt_override is not None:
+                            node["inputs"]["text"] = base_prompt_override
+                        elif "negative" in title and base_negative_override is not None:
+                            node["inputs"]["text"] = base_negative_override
+                else:
+                    # SD WebUI: payloadのキーを上書き
+                    if base_prompt_override is not None:
+                        payload["prompt"] = base_prompt_override
+                    if base_negative_override is not None:
+                        payload["negative_prompt"] = base_negative_override
+                print(f"[⚙️] プリセットプロンプト上書き適用")
 
             # --- 解像度指定 (resolutionクエリ) の解析 ---
             res_param = qs.get("resolution", [None])[0]

@@ -8,7 +8,8 @@
 // @match        https://www.genspark.ai/*
 // @match        https://grok.com/*
 // @match        https://aistudio.google.com/*
-// @version      v134
+// @match        https://192.168.1.PWAサーバー/geminipwa/*
+// @version      v139
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -100,7 +101,8 @@
         'www.perplexity.ai': ['.prose', '[data-cplx-component="message-block-answer"]'],
         'www.genspark.ai': ['.conversation-statement.assistant'],
         'grok.com': ['.message-bubble.w-full .response-content-markdown'],
-        'aistudio.google.com': ['.model-prompt-container[data-turn-role="Model"]']
+        'aistudio.google.com': ['.model-prompt-container[data-turn-role="Model"]'],
+        '192.168.1.PWAサーバー': ['.message-content']
     };
 
     /**
@@ -120,15 +122,33 @@
      * 🪄《...》のようなパターンを正しく検出できないため、複数ノードを結合してスキャンする必要があります。
      */
     const NEEDS_MULTI_NODE_SCAN = [
-        "www.perplexity.ai"
+        "www.perplexity.ai",
+        "192.168.1.PWAサーバー"
     ];
 
     /**
-     * 現在のサイトがマルチノードスキャンを必要とするかどうかを判定します。
-     * @returns {boolean}
+     * 自動スキャンを有効にするホスト名のリスト
+     * 該当ホストではスキャンボタンを表示せず、定期的に自動スキャンします。
      */
+    const AUTO_SCAN_HOSTS = [
+        "192.168.1.PWAサーバー"
+    ];
+
+    /** 通常時のスキャン間隔 (ms) */
+    const SCAN_INTERVAL_NORMAL = 3000;
+    /** DOM変化検知後の高速スキャン間隔 (ms) */
+    const SCAN_INTERVAL_FAST = 200;
+    /** 高速スキャンを維持する時間 (ms) */
+    const FAST_SCAN_WINDOW = 5000;
+    /** DOM変化チェックの間隔 (ms) */
+    const CHANGE_CHECK_INTERVAL = 3000;
+
     function needsMultiNodeScan() {
         return NEEDS_MULTI_NODE_SCAN.includes(window.location.hostname);
+    }
+
+    function isAutoScanHost() {
+        return AUTO_SCAN_HOSTS.includes(window.location.hostname);
     }
 
     /* =========================================================================
@@ -470,75 +490,284 @@
         promptText.style.borderRadius = "8px";
         promptText.style.marginTop = "4px";
         promptText.style.background = "transparent";
-        promptText.textContent =
+
+        // プロンプト文字列用のテキストノード (後で更新するため分離)
+        const promptTextNode = document.createTextNode(
             `prompt: ${prompt}\nfilename: ${filename}` +
             (preset ? `\npreset: ${preset}` : "") +
-            (resolution ? `\nres: ${resolution}` : "");
-        details.appendChild(promptText);
+            (resolution ? `\nres: ${resolution}` : "")
+        );
+        promptText.appendChild(promptTextNode);
+
+        // --- 現在のネガティブを保持 (URL再構築用) ---
+        let currentNeg = "";
+
+        // --- ボタン用コンテナ ---
+        const btnContainer = document.createElement("span");
+        btnContainer.style.whiteSpace = "nowrap";
+
+        // --- ボタン共通スタイル生成 ---
+        const mkBtn = (emoji, title, hoverBg, hoverBorder) => {
+            const b = document.createElement("button");
+            b.textContent = emoji; b.title = title;
+            b.style.cssText = [
+                "display:inline-block;",
+                "padding:3px 8px;",
+                "cursor:pointer;",
+                "border:1px solid #999;",
+                "border-radius:6px;",
+                "background:transparent;",
+                "color:inherit;",
+                "font-size:1em;",
+                "verticalAlign:middle;",
+                "transition:background-color 0.2s;",
+                "line-height:1.4;",
+            ].join("");
+            b.onmouseover = () => { b.style.backgroundColor = hoverBg; b.style.borderColor = hoverBorder; };
+            b.onmouseout = () => { b.style.backgroundColor = "transparent"; b.style.borderColor = "#999"; };
+            return b;
+        };
 
         // --- ゴミ箱ボタン ---
-        const delBtn = document.createElement("button");
-        delBtn.textContent = "🗑️";
-        delBtn.title = "この画像をゴミ箱へ移動";
-        delBtn.style.display = "inline-block";
-        delBtn.style.marginLeft = "6px";
-        delBtn.style.padding = "2px 6px";
-        delBtn.style.cursor = "pointer";
-        delBtn.style.border = "1px solid #ddd";
-        delBtn.style.borderRadius = "4px";
-        delBtn.style.backgroundColor = "#fff";
-        delBtn.style.fontSize = "0.9em";
-        delBtn.style.verticalAlign = "middle";
-        delBtn.style.transition = "background-color 0.2s";
-
-        // ホバーエフェクト
-        delBtn.onmouseover = () => {
-            delBtn.style.backgroundColor = "#ffebee";
-            delBtn.style.borderColor = "#ef9a9a";
-        };
-        delBtn.onmouseout = () => {
-            delBtn.style.backgroundColor = "#fff";
-            delBtn.style.borderColor = "#ddd";
-        };
-
-        // 削除処理
+        const delBtn = mkBtn("🗑️", "この画像をゴミ箱へ移動", "rgba(239,154,154,0.3)", "#ef9a9a");
         delBtn.onclick = (e) => {
             e.preventDefault();
             if (!confirm("この画像をゴミ箱へ移動しますか？\n※ ページをリロードすると再生成されます。")) return;
-
-            delBtn.textContent = "⏳ 移動中...";
+            delBtn.textContent = "⏳";
             delBtn.disabled = true;
-
-            // Image要素を使用してAPIリクエスト (CORS回避のため)
             const trashImg = new Image();
-            const targetPath = GENERATE_DIR + filename;
-            trashImg.src = `${BASE_URL}api/trash?path=${encodeURIComponent(targetPath)}&t=${Date.now()}`;
-
+            trashImg.src = `${BASE_URL}api/trash?path=${encodeURIComponent(GENERATE_DIR + filename)}&t=${Date.now()}`;
             trashImg.onload = () => {
-                // 削除成功: UIを更新
                 delBtn.textContent = "✓";
-                delBtn.style.border = "1px solid #4caf50";
-                delBtn.style.color = "#4caf50";
-
-                // 削除済みであることを視覚的に表示
+                delBtn.style.borderColor = "#4caf50"; delBtn.style.color = "#4caf50";
                 details.style.opacity = "0.6";
                 promptText.style.textDecoration = "line-through";
                 const thumb = details.querySelector("img");
                 if (thumb) thumb.style.opacity = "0.4";
-
-                console.log("[AIChat Image Replacer] ゴミ箱へ移動:", filename);
+                console.log("[SDinChat] ゴミ箱へ移動:", filename);
             };
-
             trashImg.onerror = () => {
-                // 削除失敗: エラー表示
                 alert("❌ 削除に失敗しました\nサーバーが起動しているか確認してください。");
-                console.error("[AIChat Image Replacer] ゴミ箱移動リクエスト失敗");
-                delBtn.textContent = "🗑️";
-                delBtn.disabled = false;
+                delBtn.textContent = "🗑️"; delBtn.disabled = false;
             };
         };
 
-        promptText.appendChild(delBtn);
+        // --- 編集ボタン ---
+        const editBtn = mkBtn("✏️", "プロンプトを編集して再生成", "rgba(144,202,249,0.3)", "#90caf9");
+
+        // --- 保存ボタン (WebUIへ橋渡し) ---
+        const saveBtn = mkBtn("📋", "このプロンプトを生成WebUIに送る", "rgba(165,214,167,0.3)", "#a5d6a7");
+        saveBtn.onclick = (e) => {
+            e.preventDefault();
+            const data = { prompt, filename, preset, resolution, negative: currentNeg };
+            const beacon = new Image();
+            beacon.src = `${BASE_URL}api/clipboard?data=${encodeURIComponent(JSON.stringify(data))}&t=${Date.now()}`;
+            beacon.onload = () => {
+                saveBtn.textContent = "✓"; saveBtn.style.color = "#4caf50";
+                setTimeout(() => { saveBtn.textContent = "📋"; saveBtn.style.color = ""; }, 1500);
+            };
+            beacon.onerror = () => { saveBtn.textContent = "❌"; setTimeout(() => { saveBtn.textContent = "📋"; }, 1500); };
+        };
+
+        btnContainer.style.marginLeft = "8px";
+        btnContainer.style.display = "inline-flex";
+        btnContainer.style.gap = "12px";
+        btnContainer.appendChild(delBtn);
+        btnContainer.appendChild(editBtn);
+        btnContainer.appendChild(saveBtn);
+        promptText.appendChild(btnContainer);
+        details.appendChild(promptText);
+
+        // ================================================================
+        //  編集エリア (promptText と入れ替わって表示される)
+        // ================================================================
+        const editArea = document.createElement("div");
+        editArea.style.display = "none";
+        editArea.style.marginTop = "4px";
+        editArea.style.padding = "4px 6px"; // 狭め
+        editArea.style.border = "1px solid #999";
+        editArea.style.borderRadius = "8px";
+        // 背景なし (ダークモード対応)
+
+        const mkLabel = (text) => {
+            const d = document.createElement("div");
+            d.textContent = text;
+            Object.assign(d.style, { fontSize: "0.8em", color: "inherit", opacity: "0.7", marginBottom: "2px" });
+            return d;
+        };
+        // 内容に応じて高さが伸縮するテキストエリアを生成する
+        const mkTextarea = (val, ph) => {
+            const ta = document.createElement("textarea");
+            ta.value = val;
+            ta.placeholder = ph || "";
+            ta.rows = 1; // 最小1行; 実際の高さはscrollHeightで制御
+            ta.style.cssText = "width:100%;font-size:0.85em;padding:4px 6px;border:1px solid #999;border-radius:4px;resize:none;overflow:hidden;box-sizing:border-box;font-family:monospace;background:transparent;color:inherit;display:block;";
+            // 内容に合わせて高さを調整する関数
+            const autoResize = () => {
+                ta.style.height = "auto";         // 一旦縮めてscrollHeightを正確に取得
+                ta.style.height = ta.scrollHeight + "px";
+            };
+            ta.addEventListener("input", autoResize);
+            // DOM挿入後に初回リサイズ (挿入前はscrollHeight=0になるため)
+            requestAnimationFrame(autoResize);
+            return ta;
+        };
+
+        const promptInput = mkTextarea(prompt, "");
+        const negInput = mkTextarea("", "(任意)");
+
+        // 元のURLからネガティブプロンプトを復元
+        try {
+            const origUrl = new URL(img.src);
+            const origNeg = origUrl.searchParams.get("negative");
+            if (origNeg) {
+                negInput.value = origNeg;
+                currentNeg = origNeg;
+                // negInputはまだDOM未挿入なのでrAF後に再調整
+                requestAnimationFrame(() => {
+                    negInput.style.height = "auto";
+                    negInput.style.height = negInput.scrollHeight + "px";
+                });
+            }
+        } catch (e) { }
+
+
+        const btnRow = document.createElement("div");
+        Object.assign(btnRow.style, { marginTop: "6px", display: "flex", gap: "6px" });
+
+        const regenBtn = document.createElement("button");
+        regenBtn.textContent = "🔄 再生成";
+        regenBtn.style.cssText = "padding:6px 14px;font-size:0.85em;border:none;border-radius:4px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;cursor:pointer;font-weight:bold;";
+
+        // キャンセルボタン: 背景なし・枠のみ・色inherit でダークモード対応
+        const cancelBtn = document.createElement("button");
+        cancelBtn.textContent = "キャンセル";
+        cancelBtn.style.cssText = "padding:6px 14px;font-size:0.85em;border:1px solid #999;border-radius:4px;background:transparent;color:inherit;cursor:pointer;";
+
+        // --- 再生成中の画像フィードバック ---
+        const setRegenerating = (active) => {
+            if (active) {
+                img.style.opacity = "0.4";
+                img.style.filter = "blur(2px)";
+                img.style.transition = "opacity 0.3s, filter 0.3s";
+                // サマリー内にローディングインジケータを追加
+                let loader = summary.querySelector(".sdinchat-loader");
+                if (!loader) {
+                    loader = document.createElement("div");
+                    loader.className = "sdinchat-loader";
+                    loader.textContent = "🔄 再生成中...";
+                    Object.assign(loader.style, {
+                        position: "absolute", top: "50%", left: "50%",
+                        transform: "translate(-50%,-50%)",
+                        background: "rgba(0,0,0,0.6)", color: "#fff",
+                        padding: "8px 16px", borderRadius: "20px",
+                        fontSize: "0.85em", fontWeight: "bold", pointerEvents: "none"
+                    });
+                    summary.style.position = "relative";
+                    summary.appendChild(loader);
+                }
+            } else {
+                img.style.opacity = "1";
+                img.style.filter = "none";
+                const loader = summary.querySelector(".sdinchat-loader");
+                if (loader) loader.remove();
+            }
+        };
+
+        // --- 再生成処理 ---
+        regenBtn.onclick = (e) => {
+            e.preventDefault();
+            const newPrompt = promptInput.value.trim();
+            if (!newPrompt) { alert("プロンプトを入力してください"); return; }
+
+            regenBtn.textContent = "⏳ 処理中...";
+            regenBtn.disabled = true;
+            setRegenerating(true);
+
+            // 1. mark_rewrite ビーコン
+            const markBeacon = new Image();
+            markBeacon.src = `${BASE_URL}api/mark_rewrite?path=${encodeURIComponent(GENERATE_DIR + filename)}&t=${Date.now()}`;
+
+            const doRegen = () => {
+                // 2. img src を更新
+                const newNeg = negInput.value.trim();
+                currentNeg = newNeg;
+
+                let newUrl = `${BASE_URL}${GENERATE_DIR}${filename}?gen_image=1&prompt=${encodeURIComponent(newPrompt)}`;
+                if (preset) newUrl += `&preset=${encodeURIComponent(preset)}`;
+                if (resolution) newUrl += `&resolution=${encodeURIComponent(resolution)}`;
+                if (newNeg) newUrl += `&negative=${encodeURIComponent(newNeg)}`;
+                newUrl += `&_t=${Date.now()}`;
+
+                // onload で再生成フィードバック解除
+                const origOnload = img.onload;
+                img.onload = function () {
+                    setRegenerating(false);
+                    if (origOnload) origOnload.call(this);
+                };
+                const origOnerror = img.onerror;
+                img.onerror = function () {
+                    setRegenerating(false);
+                    if (origOnerror) origOnerror.call(this);
+                };
+
+                img.src = newUrl;
+
+                // 削除済み状態をリセット
+                details.style.opacity = "1";
+                promptText.style.textDecoration = "none";
+
+                // プロンプト表示を更新
+                promptTextNode.textContent =
+                    `prompt: ${newPrompt}\nfilename: ${filename}` +
+                    (preset ? `\npreset: ${preset}` : "") +
+                    (resolution ? `\nres: ${resolution}` : "") +
+                    (newNeg ? `\nnegative: ${newNeg}` : "");
+
+                // 表示を切り替え: 編集 → プロンプト表示
+                editArea.style.display = "none";
+                promptText.style.display = "";
+                regenBtn.textContent = "🔄 再生成";
+                regenBtn.disabled = false;
+
+                console.log(`[SDinChat] 再生成: ${filename} prompt: ${newPrompt.substring(0, 50)}...`);
+            };
+
+            markBeacon.onload = doRegen;
+            markBeacon.onerror = () => {
+                console.warn("[SDinChat] mark_rewrite 失敗、再生成を続行");
+                doRegen();
+            };
+        };
+
+        // --- キャンセル: 編集 → プロンプト表示に戻す ---
+        cancelBtn.onclick = (e) => {
+            e.preventDefault();
+            editArea.style.display = "none";
+            promptText.style.display = "";
+        };
+
+        btnRow.appendChild(regenBtn);
+        btnRow.appendChild(cancelBtn);
+        editArea.appendChild(mkLabel("プロンプト:"));
+        editArea.appendChild(promptInput);
+        editArea.appendChild(mkLabel("ネガティブ:"));
+        editArea.appendChild(negInput);
+        editArea.appendChild(btnRow);
+        details.appendChild(editArea);
+
+        // --- 編集ボタン: プロンプト表示 → 編集エリアに切り替え ---
+        editBtn.onclick = (e) => {
+            e.preventDefault();
+            promptText.style.display = "none";
+            editArea.style.display = "block";
+            // display:none 中は scrollHeight=0 のため、表示後に初回リサイズ
+            [promptInput, negInput].forEach(ta => {
+                ta.style.height = "auto";
+                ta.style.height = ta.scrollHeight + "px";
+            });
+            promptInput.focus();
+        };
 
         return details;
     };
@@ -779,36 +1008,50 @@
     }
 
     /* =========================================================================
-     * ■ フローティングスキャンボタン
+     * ■ フローティングスキャンボタン (スワイプで四隅移動)
      * ========================================================================= */
 
-    /** ボタン位置の状態 (true: 上, false: 下) */
-    let isButtonTop = false;
+    /**
+     * ボタン位置: 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left'
+     * 上下は画面の10%を除いた領域に収める
+     */
+    let scanBtnCorner = 'bottom-right';
+
+    /**
+     * 指定コーナーに対応する CSS top/bottom/left/right を返す
+     * 上下10%を空けるために vh 単位で指定
+     */
+    function cornerToCSS(corner) {
+        const margin = '20px';
+        const vEdge = '10vh';  // 上下10%の空き
+        switch (corner) {
+            case 'top-left': return `top:${vEdge}; left:${margin}; bottom:auto; right:auto;`;
+            case 'top-right': return `top:${vEdge}; right:${margin}; bottom:auto; left:auto;`;
+            case 'bottom-left': return `bottom:${vEdge}; left:${margin}; top:auto; right:auto;`;
+            case 'bottom-right': return `bottom:${vEdge}; right:${margin}; top:auto; left:auto;`;
+        }
+    }
 
     /**
      * フローティングスキャンボタンを作成してDOMに挿入します。
-     * ボタンをクリックすると、手動でフルスキャンが実行されます。
+     * ボタンをクリックすると手動でフルスキャンを実行。
+     * 長めのスワイプで四隅に移動。
      */
     function createScanButton() {
-        // 既存のボタンがあれば削除
         const existing = document.getElementById('sdinchat-scan-container');
         if (existing) existing.remove();
 
-        // コンテナ作成
         const container = document.createElement('div');
         container.id = 'sdinchat-scan-container';
         container.style.cssText = `
             position: fixed;
-            ${isButtonTop ? 'top: 20px;' : 'bottom: 20px;'}
-            right: 20px;
+            ${cornerToCSS(scanBtnCorner)}
             z-index: 999999;
-            display: flex;
-            flex-direction: column;
-            align-items: flex-end;
-            gap: 8px;
+            user-select: none;
+            touch-action: none;
         `;
 
-        // --- メインスキャンボタン ---
+        // --- スキャンボタン ---
         const scanBtn = document.createElement('button');
         scanBtn.id = 'sdinchat-scan-button';
         scanBtn.textContent = '🔍 スキャン';
@@ -824,6 +1067,7 @@
             box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
             transition: transform 0.2s, box-shadow 0.2s;
             user-select: none;
+            touch-action: none;
         `;
         scanBtn.onmouseenter = () => {
             scanBtn.style.transform = 'scale(1.05)';
@@ -846,55 +1090,111 @@
             }, 50);
         };
 
-        // --- 位置切り替えボタン ---
-        const toggleBtn = document.createElement('button');
-        toggleBtn.id = 'sdinchat-toggle-position';
-        toggleBtn.textContent = isButtonTop ? '⬇' : '⬆';
-        toggleBtn.title = 'ボタンの位置を切り替え';
-        toggleBtn.style.cssText = `
-            padding: 6px 10px;
-            font-size: 12px;
-            border: none;
-            border-radius: 50%;
-            background: rgba(100, 100, 100, 0.7);
-            color: white;
-            cursor: pointer;
-            transition: background 0.2s;
-            user-select: none;
-        `;
-        toggleBtn.onmouseenter = () => {
-            toggleBtn.style.background = 'rgba(100, 100, 100, 0.9)';
+        // --- スワイプで四隅移動 ---
+        // 長スワイプ (80px以上) で方向をx/y別に判定して最近傍の隅へ
+        let swipeStartX = 0, swipeStartY = 0;
+        const SWIPE_THRESHOLD = 80; // px
+
+        const onPointerDown = (e) => {
+            swipeStartX = e.clientX;
+            swipeStartY = e.clientY;
         };
-        toggleBtn.onmouseleave = () => {
-            toggleBtn.style.background = 'rgba(100, 100, 100, 0.7)';
+        const onPointerUp = (e) => {
+            const dx = e.clientX - swipeStartX;
+            const dy = e.clientY - swipeStartY;
+            const adx = Math.abs(dx), ady = Math.abs(dy);
+
+            // 短いタップはクリックとして処理 (scanBtn.onclick に委譲)
+            if (adx < SWIPE_THRESHOLD && ady < SWIPE_THRESHOLD) return;
+
+            // 縦横どちらが大きいかで軸を決定 (斜め移動なし)
+            const vHalf = window.innerHeight / 2;
+            const hHalf = window.innerWidth / 2;
+            const [curV, curH] = scanBtnCorner.split('-'); // 'top'/'bottom', 'left'/'right'
+
+            let newV = curV, newH = curH;
+            if (adx >= ady) {
+                // 横スワイプ → 左右を切り替え
+                newH = dx > 0 ? 'right' : 'left';
+            } else {
+                // 縦スワイプ → 上下を切り替え
+                newV = dy > 0 ? 'bottom' : 'top';
+            }
+
+            const newCorner = `${newV}-${newH}`;
+            if (newCorner !== scanBtnCorner) {
+                scanBtnCorner = newCorner;
+                createScanButton();
+            }
+            e.preventDefault();
         };
-        toggleBtn.onclick = () => {
-            isButtonTop = !isButtonTop;
-            createScanButton(); // 再描画
-        };
+
+        // マウスとタッチ両対応
+        container.addEventListener('pointerdown', onPointerDown);
+        container.addEventListener('pointerup', onPointerUp);
 
         container.appendChild(scanBtn);
-        container.appendChild(toggleBtn);
         document.body.appendChild(container);
-
         console.log('[SDinChat] フローティングスキャンボタンを作成しました');
+    }
+
+    /* =========================================================================
+     * ■ 自動スキャンループ (AUTO_SCAN_HOSTS 該当サイトのみ使用)
+     * ========================================================================= */
+
+    let _nextScanAt = 0;
+    let _lastChangeValue = 0;
+    let _fastModeUntil = 0;
+
+    /** 最新のAI応答コンテナの文字数を測定し変化検知に使う */
+    function measureDomChange() {
+        const hostname = window.location.hostname;
+        const selectors = SITE_SELECTORS[hostname];
+        if (!selectors) return 0;
+        const nodes = document.querySelectorAll(selectors.join(','));
+        if (!nodes.length) return 0;
+        return nodes[nodes.length - 1].textContent.length;
+    }
+
+    function autoScanLoop() {
+        const now = Date.now();
+        const interval = (now < _fastModeUntil) ? SCAN_INTERVAL_FAST : SCAN_INTERVAL_NORMAL;
+        if (now >= _nextScanAt) {
+            fullScan();
+            _nextScanAt = now + interval;
+        }
+        setTimeout(autoScanLoop, 50);
+    }
+
+    function domChangeMonitorLoop() {
+        const now = Date.now();
+        const val = measureDomChange();
+        if (val !== _lastChangeValue) {
+            _fastModeUntil = now + FAST_SCAN_WINDOW;
+            _lastChangeValue = val;
+        }
+        setTimeout(domChangeMonitorLoop, CHANGE_CHECK_INTERVAL);
     }
 
     /* =========================================================================
      * ■ 初期化処理
      * ========================================================================= */
 
-    /**
-     * スクリプトの初期化を安全に実行します。
-     *
-     * ページ読み込み直後はDOM構造が不安定な場合があるため、
-     * 2秒の遅延を設けてから処理を開始します。
-     */
     function safeInit() {
         setTimeout(() => {
-            createScanButton();
-            fullScan(); // 初回は自動でスキャン
-            console.log('[SDinChat] 初期化完了');
+            fullScan(); // 初回は常に実行
+
+            if (isAutoScanHost()) {
+                // 自動スキャンモード: ボタンなし、定期スキャン
+                _lastChangeValue = measureDomChange();
+                domChangeMonitorLoop();
+                autoScanLoop();
+                console.log('[SDinChat] 自動スキャンモードで起動しました');
+            } else {
+                // 手動スキャンモード: フローティングボタンを表示
+                createScanButton();
+                console.log('[SDinChat] 手動スキャンモードで起動しました');
+            }
         }, 2000);
     }
 
